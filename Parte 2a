@@ -1,0 +1,31 @@
+// SEL0433 - Projeto 3 - Parte 2a
+
+#include <ESP32Servo.h>
+
+const int PIN_SERVO = 23;
+const int PIN_POT   = 35; // GPIO somente-entrada, ADC1_CH7
+
+Servo servo;
+
+void setup() {
+  Serial.begin(115200);
+
+  servo.setPeriodHertz(50);           // periodo padrao de servos: 20 ms
+  servo.attach(PIN_SERVO, 500, 2400); // pulsos de 0,5 ms (0 graus) a 2,4 ms (180 graus)
+
+  Serial.println("SEL0433 - Parte 2a: servo + potenciometro");
+}
+
+void loop() {
+  static int adcFiltrado = analogRead(PIN_POT);
+  int adc = analogRead(PIN_POT);                     // 0..4095 (ADC de 12 bits)
+  adcFiltrado = (3 * adcFiltrado + adc) / 4;         // media movel simples (anti-ruido)
+  int angulo = map(adcFiltrado, 0, 4095, 0, 180);    // posicao do servo
+  int dutyPct = map(adcFiltrado, 0, 4095, 0, 100);   // "duty" de controle exibido em %
+
+  servo.write(angulo);
+
+  Serial.printf("ADC: %4d | Controle: %3d%% | Angulo: %3d graus\n",
+                adcFiltrado, dutyPct, angulo);
+  delay(100);
+}
