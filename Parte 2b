@@ -1,0 +1,279 @@
+// SEL0433 - Projeto 3 - Parte 2b
+// Aplicacao propria com a biblioteca nativa MCPWM:
+// CANCELA AUTOMATICA DE ESTACIONAMENTO
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// Backend de geracao do pulso do servo
+
+#define MODO_SIMULACAO_WOKWI 1
+
+#if !MODO_SIMULACAO_WOKWI
+#include "driver/mcpwm_prelude.h"
+#endif
+
+// Pinos
+const int PIN_SERVO  = 19; // pulso do servo (MCPWM ou LEDC, conforme o modo)
+const int PIN_TRIG   = 17;
+const int PIN_ECHO   = 16; // em hardware real, usar divisor de tensao (ECHO e 5 V)
+const int PIN_BOTAO  = 25;  // INPUT_PULLUP -> GND
+const int PIN_BUZZER = 27; // tom via LEDC (coexiste com o MCPWM)
+const int PIN_LED_VD = 32; // verde: cancela aberta
+const int PIN_LED_VM = 33; // vermelho: fechada / em movimento
+// OLED no I2C padrao: SDA = 21, SCL = 22
+
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+
+// Parametros
+const float    LIMIAR_CM       = 45.0; // distancia de deteccao do veiculo
+const uint32_t TEMPO_ABERTA_MS = 4000; // aberta apos a area ficar livre
+const int      ANG_ABERTA      = 90;
+const int      PASSO_GRAUS     = 2;    // suavidade do movimento
+const uint32_t SERVO_MIN_US    = 500;  // pulso p/ 0 graus
+const uint32_t SERVO_MAX_US    = 2400; // pulso p/ 180 graus
+
+// Geracao do pulso do servo
+// Nos dois backends: periodo de 20 ms (50 Hz); a posicao do servo e definida
+// pela largura do pulso em microssegundos (500..2400 us).
+
+#if MODO_SIMULACAO_WOKWI
+
+// Backend LEDC (somente para a simulacao no Wokwi)
+// 50 Hz com 14 bits -> 16384 ticks por periodo de 20 ms (1 tick ~ 1,22 us)
+const uint8_t RES_SERVO_BITS = 14;
+
+void configuraPWMServo() {
+  ledcAttach(PIN_SERVO, 50, RES_SERVO_BITS);
+}
+
+void aplicaPulsoServo(uint32_t pulso_us) {
+  uint32_t duty = (uint32_t)(((uint64_t)pulso_us << RES_SERVO_BITS) / 20000);
+  ledcWrite(PIN_SERVO, duty);
+}
+
+#else
+
+// Backend MCPWM (implementacao principal - hardware real)
+
+mcpwm_timer_handle_t timerServo = NULL;
+mcpwm_oper_handle_t  operServo  = NULL;
+mcpwm_cmpr_handle_t  compServo  = NULL;
+mcpwm_gen_handle_t   genServo   = NULL;
+
+void configuraPWMServo() {
+  mcpwm_timer_config_t tcfg = {};
+  tcfg.group_id      = 0;
+  tcfg.clk_src       = MCPWM_TIMER_CLK_SRC_DEFAULT;
+  tcfg.resolution_hz = 1000000; // 1 MHz
+  tcfg.count_mode    = MCPWM_TIMER_COUNT_MODE_UP;
+  tcfg.period_ticks  = 20000;   // 20 ms
+  ESP_ERROR_CHECK(mcpwm_new_timer(&tcfg, &timerServo));
+
+  mcpwm_operator_config_t ocfg = {};
+  ocfg.group_id = 0;
+  ESP_ERROR_CHECK(mcpwm_new_operator(&ocfg, &operServo));
+  ESP_ERROR_CHECK(mcpwm_operator_connect_timer(operServo, timerServo));
+
+  mcpwm_comparator_config_t ccfg = {};
+  ccfg.flags.update_cmp_on_tez = true; // novo valor vale no inicio do periodo
+  ESP_ERROR_CHECK(mcpwm_new_comparator(operServo, &ccfg, &compServo));
+
+  mcpwm_generator_config_t gcfg = {};
+  gcfg.gen_gpio_num = PIN_SERVO;
+  ESP_ERROR_CHECK(mcpwm_new_generator(operServo, &gcfg, &genServo));
+
+  // Sinal sobe no inicio do periodo (contador vazio)
+  ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(genServo,
+      MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
+                                   MCPWM_TIMER_EVENT_EMPTY,
+                                   MCPWM_GEN_ACTION_HIGH)));
+  // Desce quando o contador atinge o comparador (fim do pulso)
+  ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(genServo,
+      MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
+                                     compServo,
+                                     MCPWM_GEN_ACTION_LOW)));
+
+  ESP_ERROR_CHECK(mcpwm_timer_enable(timerServo));
+  ESP_ERROR_CHECK(mcpwm_timer_start_stop(timerServo, MCPWM_TIMER_START_NO_STOP));
+}
+
+void aplicaPulsoServo(uint32_t pulso_us) {
+  ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(compServo, pulso_us));
+}
+
+#endif  // MODO_SIMULACAO_WOKWI
+
+uint32_t anguloParaPulsoUs(int ang) {
+  ang = constrain(ang, 0, 180);
+  return SERVO_MIN_US + (uint32_t)((SERVO_MAX_US - SERVO_MIN_US) * (uint32_t)ang / 180);
+}
+
+void escreveServo(int ang) {
+  aplicaPulsoServo(anguloParaPulsoUs(ang));
+}
+
+// Sensor ultrassonico
+float leDistanciaCm() {
+  digitalWrite(PIN_TRIG, LOW);  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  unsigned long dur = pulseIn(PIN_ECHO, HIGH, 25000); // timeout ~4,3 m
+  if (dur == 0) return 999.0;                          // sem eco
+  return dur / 58.0;                                   // us -> cm
+}
+
+// Botao (interrupcao externa)
+volatile bool pedidoManual = false;
+volatile uint32_t ultimoBotaoMs = 0;
+
+void IRAM_ATTR isrBotao() {
+  uint32_t agora = millis();
+  if (agora - ultimoBotaoMs > 250) { // debounce por software
+    pedidoManual = true;
+    ultimoBotaoMs = agora;
+  }
+}
+
+// Maquina de estados
+enum Estado { FECHADA, ABRINDO, ABERTA, FECHANDO };
+
+
+void mudaEstado(Estado novo);
+
+Estado estado = FECHADA;
+const char *NOME_ESTADO[] = { "FECHADA", "ABRINDO", "ABERTA", "FECHANDO" };
+
+int      angulo = 0;      // 0 = braco abaixado
+int      carros = 0;      // veiculos que passaram
+bool     aberturaPorVeiculo = false;
+float    distancia = 999;
+uint32_t tLivre = 0;      // instante em que a area ficou livre
+uint32_t tTelemetria = 0;
+
+void mudaEstado(Estado novo) {
+  estado = novo;
+  Serial.printf("[%8lu ms] Estado -> %-8s | dist: %6.1f cm | carros: %d\n",
+                millis(), NOME_ESTADO[novo], distancia, carros);
+}
+
+void atualizaOled() {
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);
+  oled.println("Cancela  SEL0433");
+  oled.setTextSize(2);
+  oled.setCursor(0, 14);
+  oled.println(NOME_ESTADO[estado]);
+  oled.setTextSize(1);
+  oled.setCursor(0, 38);
+  if (distancia > 400) oled.println("Dist: ---");
+  else                 oled.printf("Dist: %.1f cm\n", distancia);
+  oled.setCursor(0, 50);
+  oled.printf("Ang: %3d  Carros: %d", angulo, carros);
+  oled.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_LED_VD, OUTPUT);
+  pinMode(PIN_LED_VM, OUTPUT);
+  pinMode(PIN_BOTAO, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_BOTAO), isrBotao, FALLING);
+
+  ledcAttach(PIN_BUZZER, 2000, 10); // buzzer por LEDC (ledcWriteTone)
+
+  Wire.begin(); // SDA 21, SCL 22
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Falha ao iniciar o OLED SSD1306 (endereco 0x3C).");
+  }
+
+  configuraPWMServo();
+  escreveServo(0); // cancela comeca fechada
+
+#if MODO_SIMULACAO_WOKWI
+  Serial.println("PWM do servo: LEDC (Wokwi nao emula o MCPWM; em hardware real, use MODO_SIMULACAO_WOKWI 0)");
+#else
+  Serial.println("PWM do servo: MCPWM nativo (mcpwm_prelude)");
+#endif
+
+  Serial.println();
+  Serial.println("SEL0433 - Parte 2b: cancela automatica (MCPWM + HC-SR04 + OLED)");
+  Serial.println("Aproxime um 'veiculo' (< 45 cm) ou use o botao para abrir/fechar.");
+}
+
+void loop() {
+  distancia = leDistanciaCm();
+  bool veiculo = distancia < LIMIAR_CM;
+
+  switch (estado) {
+    case FECHADA:
+      digitalWrite(PIN_LED_VM, HIGH);
+      digitalWrite(PIN_LED_VD, LOW);
+      if (veiculo || pedidoManual) {
+        aberturaPorVeiculo = veiculo; // abertura manual nao conta veiculo
+        pedidoManual = false;
+        mudaEstado(ABRINDO);
+      }
+      break;
+
+    case ABRINDO:
+      ledcWriteTone(PIN_BUZZER, 880);                 // bipe de movimento
+      digitalWrite(PIN_LED_VM, (millis() / 200) % 2); // vermelho piscando
+      angulo += PASSO_GRAUS;
+      if (angulo >= ANG_ABERTA) {
+        angulo = ANG_ABERTA;
+        ledcWriteTone(PIN_BUZZER, 0);
+        if (aberturaPorVeiculo) carros++;
+        aberturaPorVeiculo = false;
+        tLivre = millis();
+        mudaEstado(ABERTA);
+      }
+      escreveServo(angulo);
+      break;
+
+    case ABERTA:
+      digitalWrite(PIN_LED_VD, HIGH);
+      digitalWrite(PIN_LED_VM, LOW);
+      if (veiculo) tLivre = millis(); // com veiculo presente, nao fecha
+      if (pedidoManual) {
+        pedidoManual = false;
+        mudaEstado(FECHANDO);
+      } else if (millis() - tLivre > TEMPO_ABERTA_MS) {
+        mudaEstado(FECHANDO);
+      }
+      break;
+
+    case FECHANDO:
+      ledcWriteTone(PIN_BUZZER, 523);
+      digitalWrite(PIN_LED_VD, LOW);
+      digitalWrite(PIN_LED_VM, (millis() / 200) % 2);
+      if (veiculo) {            // seguranca: reabre se detectar veiculo
+        mudaEstado(ABRINDO);   // reabre sem nova contagem
+        break;
+      }
+      angulo -= PASSO_GRAUS;
+      if (angulo <= 0) {
+        angulo = 0;
+        ledcWriteTone(PIN_BUZZER, 0);
+        mudaEstado(FECHADA);
+      }
+      escreveServo(angulo);
+      break;
+  }
+
+  atualizaOled();
+
+  if (millis() - tTelemetria > 500) { // telemetria periodica pela UART
+    tTelemetria = millis();
+    Serial.printf("estado: %-8s | dist: %6.1f cm | angulo: %3d | carros: %d\n",
+                  NOME_ESTADO[estado], distancia, angulo, carros);
+  }
+
+  delay(40);
+}
