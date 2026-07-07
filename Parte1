@@ -1,0 +1,56 @@
+// SEL0433 - Projeto 3 - Parte 1
+
+const int PIN_R = 32;
+const int PIN_G = 33;
+const int PIN_B = 25;
+
+const uint32_t PWM_FREQ = 5000; // 5 kHz
+const uint8_t  PWM_RES  = 8;    // 8 bits -> valores de 0 a 255
+
+// Incrementos independentes, em pontos percentuais por passo
+const int INC_G = 4;   // verde: 4 em 4
+const int INC_B = 8;   // azul: o dobro
+const int INC_R = 12;  // vermelho: o triplo
+
+const uint32_t PASSO_MS = 150; // intervalo entre atualizacoes
+
+int dutyR = 0, dutyG = 0, dutyB = 0; // duty atual de cada canal, em %
+
+// Converte duty em % (0..100) para o valor bruto do LEDC (0..255 em 8 bits)
+uint32_t pctParaRaw(int pct) {
+  return (uint32_t)map(pct, 0, 100, 0, (1 << PWM_RES) - 1);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+ 
+  ledcAttach(PIN_R, PWM_FREQ, PWM_RES);
+  ledcAttach(PIN_G, PWM_FREQ, PWM_RES);
+  ledcAttach(PIN_B, PWM_FREQ, PWM_RES);
+
+  Serial.println();
+  Serial.println("SEL0433 - Parte 1: PWM em LED RGB via LEDC");
+  Serial.printf("PWM: %u Hz, %u bits | Incrementos: R=+%d%% G=+%d%% B=+%d%%\n",
+                (unsigned)PWM_FREQ, PWM_RES, INC_R, INC_G, INC_B);
+}
+
+void loop() {
+  // Aplica os duty cycles atuais
+  ledcWrite(PIN_R, pctParaRaw(dutyR));
+  ledcWrite(PIN_G, pctParaRaw(dutyG));
+  ledcWrite(PIN_B, pctParaRaw(dutyB));
+
+  // Telemetria pela UART: incremento e duty aplicado em cada canal
+  Serial.printf("R(+%2d): %3d%% [%3u] | G(+%2d): %3d%% [%3u] | B(+%2d): %3d%% [%3u]\n",
+                INC_R, dutyR, (unsigned)pctParaRaw(dutyR),
+                INC_G, dutyG, (unsigned)pctParaRaw(dutyG),
+                INC_B, dutyB, (unsigned)pctParaRaw(dutyB));
+
+  // Proximo passo de cada cor: 0 -> 100%, reiniciando em loop
+  dutyR += INC_R; if (dutyR > 100) dutyR = 0;
+  dutyG += INC_G; if (dutyG > 100) dutyG = 0;
+  dutyB += INC_B; if (dutyB > 100) dutyB = 0;
+
+  delay(PASSO_MS);
+}
